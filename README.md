@@ -1,177 +1,169 @@
-# P2-ETF-SPECTRAL-FLOW
+# P2-ETF-BASELINE-BOOK
 
-Eigenvalue dynamics of the rolling correlation matrix: **where is the
-covariance spectrum moving?** — not what the returns did. Distinct from the
-existing RMT-filtering and spectral-GSP repos, which treat the spectrum as a
-static object (keep modes above the Marchenko-Pastur edge, build a graph from
-what is left).
+A **monetization study**, not a new signal.
 
-## The idea
+Across the last several engines, the only ranking information that held up on
+real data sat in the plain price baseline — momentum, volatility, beta —
+with rank-IC around 0.03–0.05. Yet the concentrated "top 3 vs the universe"
+product lost money after costs every time, and every novel feature set added
+nothing on top. This repo asks the narrower question that follows:
 
-Each day, form the correlation matrix `C(t)` of the trailing window of
-returns and eigendecompose it: `λ1(t) ≥ … ≥ λN(t)` (they sum to N). Then track
-the **flow** over a short lookback:
+> Can that baseline be turned into a book that makes money **after costs**?
+> Which kind of book? And is the P&L alpha, or just market exposure?
 
-* **market-mode flow** — `log λ1(t)/λ1(t-L)`: correlation building or
-  dissolving across the whole universe
-* **rotation flow** — the same for the mean of `λ2..λK` (typically asset-class
-  / sector modes)
-* **bulk flow** — the same for `λ(K+1)`, the top edge of the remaining bulk
+## What it does
 
-and four market-level **structure statistics**:
+**One score.** A ridge regression on four price features only — `mom5`,
+`mom21`, `vol21`, `beta` (rolling beta to the equal-weight universe) — refit at
+each rebalance on a trailing window. Nothing from any other engine.
 
-| statistic | reads as |
+**Seven books from the same ranking**, so the only thing varying is how a
+ranking becomes positions:
+
+| book | construction |
 |---|---|
-| absorption ratio (share of variance in the top ~N/5 modes; Kritzman, Li, Page & Rigobon 2011, *Principal Components as a Measure of Systemic Risk*) | correlations tightening / loosening |
-| relative spectral gap `(λ1-λ2)/λ1` | gap **collapse** = the market mode losing dominance |
-| bulk edge `λ(K+1)` | bulk **expansion** / contraction |
-| consecutive-level-spacing ratio `<r>` (Oganesyan & Huse 2007; Atas, Bogomolny, Giraud & Roux 2013) | ~0.53 = eigenvalue **repulsion** (GOE-like); ~0.39 = **condensation** / clustering (Poisson-like); needs no spectral "unfolding"; computed only when N ≥ 20 |
+| `top3_ew`, `top5_ew`, `topq_ew` | long-only equal-weight top 3 / top 5 / top quintile, measured **active vs the equal-weight universe** |
+| `ls_quintile` | long top quintile, short bottom quintile |
+| `rank_ls` | weights ∝ centered rank, dollar-neutral |
+| `ls_quintile_cn`, `rank_ls_cn` | the same two long/short books built **within each asset class** and scaled by class size, so each class's longs and shorts offset — class-neutral *by construction*, so the raw P&L is a tradable class-neutral P&L |
 
-## Two uses, kept separate on purpose
+**A grid per universe:** 2 score models (plain / class-neutral fit) × 2 training
+windows × 4 horizons (1, 5, 10, 20 days) × 7 books = 112 cells, all on
+non-overlapping holding periods.
 
-### 1. Ranking ETFs — and why dynamics only enter as interactions
+**Honest selection.** The book is chosen on the first 70% of periods only
+(eligible = positive net mean and t on that segment, with an absolute *and*
+relative period-count floor; best selection net t wins), then judged **once** on
+the untouched last 30%. The holdout is a single test, not a best-of-112.
 
-A market-level scalar ("the gap collapsed today") is the same for every ETF on
-a given day, so cross-sectional standardization erases it. It can only help
-rank ETFs when combined with each ETF's **own exposure to the mode that is
-moving** (its squared eigenvector loading): `flow_k(t) × exposure_k,i(t)`.
+**Verdict**, on the selected book's holdout:
 
-Those interaction columns are deliberately **not re-standardized across ETFs**
-— doing so strips the flow's magnitude and keeps only its sign (checked
-directly: with flow scales differing 15x between days, the product has feature
-scale 3.6 on high-flow days vs 0.5 on low-flow days as built, but exactly 1.0
-on both once re-standardized). Flow z-scores are
-winsorized at ±3 so a crisis-day outlier cannot create ±20 feature values.
+* **Supported** — gate passed, ≥30 periods, net mean > 0, and **both** the net
+  t-statistic and the market-adjusted **alpha** t-statistic ≥ 1.65
+* **Suggestive** — net mean > 0, net t ≥ 1.0, alpha t > 0
+* **Not supported** — anything else
 
-**Three nested models, same dates:**
+**Is it alpha or beta?** Each book's net returns are regressed on the
+equal-weight universe's return over the same periods: slope = market beta,
+intercept = alpha, with an alpha t-statistic. A long/short book that is quietly
+net long high-beta names earns money in a rising market with no ranking skill;
+requiring the *alpha* t-statistic is what catches that.
 
-1. *price-only* — mom5, mom21, vol21, beta
-2. *baseline* — price-only + **static** spectral exposure (squared loadings on
-   the market mode and rotation modes): ordinary PCA/RMT-style structure, no
-   dynamics
-3. *spectral* — baseline + the **dynamics** (market-mode loading change,
-   idiosyncratic-share change, and the three exposure × flow interactions)
+**What is the signal?** Each raw feature's own cross-sectional rank-IC (raw and
+class-neutral, full sample and holdout) is reported, so a blended score's IC can
+be traced to momentum, a volatility tilt, or a beta tilt — and raw IC far above
+class-neutral IC flags a feature that only separates asset classes.
 
-The gate and confidence compare model 3 against model 2, because the thesis is
-that *dynamics* add something over static spectral structure. The price-only
-comparison is shown for context only.
+**Robustness next to the pick.** Heatmaps of mean holdout net return and mean
+alpha t by book × horizon (averaged over models and windows), plus the share of
+all cells that made money. A book that is green at only one horizon is a warning,
+not a finding.
 
-### 2. Detecting structure transitions
+## Costs
 
-`lead_diagnostic` tests whether each statistic's trigger tends to sit within
-20 days before a large **aggregate** move (equal-weight universe, ≥ 2× 21-day
-realized vol over 10 days). Every statistic becomes a trigger the same way
-(Kritzman et al.'s "shift"): `z = (15-day mean − 252-day mean) / 252-day std`,
-with an onset defined as the **crossing** of ±1.5. Triggers, windows and
-thresholds are fixed in advance. The chance level and **p-value** come from a
-circular-shift permutation of the onset times against the fixed event times
-(carried over from the hyperbolic-flows engine, where an analytic
-uniform-placement formula was found to be biased on independent data).
+`TRADING_COST_BPS = 15` is a **round-trip** cost per unit of notional replaced
+(the convention of every sibling engine). A book's per-period cost is
+`sum|w_t − w_{t−1}| × 15/2` bps — for the top-3 long-only book this reproduces the
+sibling engines' "fraction of picks replaced × round-trip cost" **exactly**
+(one of three replaced → 5.000 bps; checked). Long/short books also pay
+`SHORT_BORROW_BPS_ANNUAL = 50` on short notional, prorated to the holding
+period — an **assumption**: liquid index ETFs are cheap to short, thematic ones
+are not. Taxes, market impact and borrow availability are not modeled.
 
-**Multiple comparisons, stated plainly:** five triggers × three windows ×
-three universes are tested (the dashboard prints the exact count), so a few
-small p-values are expected by luck alone.
+## The forward ledger (the part that cannot be fit to the past)
 
-## Asset-class-neutral mode (carried over, with two fixes)
+Everything in the backtest grid was designed **after** earlier engines had
+already shown this baseline looking good on these same dates, so no split of that
+history is fully out-of-sample with respect to the analyst. The ledger is the fix.
 
-`NEUTRALIZE_OPTIONS = [False, True]` runs both modes in the same grid. In
-neutral mode features **and** the forward-return target are de-meaned within
-hand-labeled asset class before ranking. This matters here more than usual:
-the top eigenvectors *are* largely asset-class modes, so unneutralized
-spectral exposure can look like skill while only separating bonds from
-equities. Two defects found on the sibling graphon engine are fixed from the
-start:
+Every run records the **target weights** of a small, fixed, pre-registered set of
+books (`config.LEDGER_BOOKS`: `top3_ew`, `top5_ew`, `ls_quintile`, `rank_ls`,
+`rank_ls_cn` × horizons 5 and 20 × a 756-day window × plain score, for each of the
+three universes = 30 books) — **no selection, never changed after seeing results**
+— and scores each one only after its holding period has fully elapsed, with the
+same cost model. A book is recorded at most once per holding period, scoring never
+rewrites a scored entry, and nothing is backfilled.
 
-* **Evaluation:** neutral rankings are scored against **class-neutral**
-  returns. Scoring them against raw returns leaves the class-level moves in as
-  pure noise and understates within-class skill (simulated: the measured IC kept
-  only 78% / 59% / 51% of the true IC when class-level dispersion was 1× / 2× /
-  3× the within-class dispersion).
-* **Small classes:** a class with fewer than `MIN_CLASS_SIZE` (3) members
-  (e.g. VNQ, the lone real-estate ETF in FI_COMMODITIES) is de-meaned against
-  the universe-wide mean, not itself. De-meaning a singleton against itself
-  made its score exactly zero every day, and it then filled a top-3 slot as a
-  0.00% "pick".
-
-## How the result is kept honest
-
-Same checks as every sibling engine, applied from the start: cross-sectional
-target; non-overlapping test points one horizon apart (Sharpe annualized by
-`sqrt(252/horizon)`); selection/holdout split; an absolute **and** relative
-selection-period floor; confidence **capped at Low whenever the selection
-gate did not pass**; the product that is tested is the top-3 minus universe
-average after cost, plus cross-sectional rank-IC.
+`forward_ledger.json` lives in the results dataset and is carried from run to run.
+If the download fails for any reason other than "file does not exist yet", the run
+**does not save or upload a ledger** — an empty one would overwrite the stored
+history. It starts empty and accrues one 5-day period per week and one 20-day
+period per month, so expect a long wait before it says anything. Thirty books are
+tracked, so judge the whole set, not its best member.
 
 ## Validation status (please read)
 
 Tested on synthetic data only; this sandbox cannot reach `huggingface.co`.
 
-* **Level-spacing ratio, known answers:** GOE matrices gave `<r>` = 0.535
-  (reference ≈ 0.531), independent (Poisson) levels 0.385 (reference
-  `2ln2−1` = 0.386), and the correlation matrix of i.i.d. noise (N=40, W=252)
-  0.526 — the same universality class as GOE, as RMT predicts.
-* **Eigendecomposition:** vectorized rolling correlation matched
-  `np.corrcoef` to 7e-16; eigenvalues summed to N to 5e-15; squared loadings
-  summed to 1 to 3e-15; eigenvalues descending.
-* **Ablation, planted signal (target only):** with the forecast target made to
-  depend on the market-mode interaction feature (features untouched), the
-  spectral model beat the static baseline with dIC t = +6.6; on the unplanted
-  null it showed dIC t = −2.0 (chance). Class-neutral mode recovered the same
-  planted signal (dIC t = +6.9 scored against neutral returns).
-* **Lead test, positive and negative controls:** a trigger engineered to lead
-  large moves by ~12 days gave hit rate 0.37 vs chance 0.13 (p = 0.003, false-
-  alarm rate 0.05 vs chance 0.66); an unrelated trigger on the same events gave
-  nothing.
-* **Lead test, null calibration** (full pipeline on noise): hit rate minus
-  chance averaged +0.002 over the 31 testable triggers; none reached p < 0.05
-  (mean p = 0.60, slightly conservative because ties count against).
-* **The flow statistics respond to a real structural change:** when a common
-  factor's loading was raised 5× at day 800, λ1 went 3.2 → 16.8, the
-  absorption ratio 0.43 → 0.73, the relative gap 0.29 → 0.92, the market-mode
-  flow z peaked at day 803, and the absorption-shift z reached 3.6.
-* **Full three-universe run** (2,500 days, up to 43 ETFs, 72 grid cells per
-  universe) takes about 45 seconds; no iterative optimization anywhere.
+* **Book weights:** every long/short book sums to 0 with long = +1 and short = −1;
+  in the class-neutral books each class's net weight is exactly 0.
+* **Costs:** one of three top-3 names replaced → 5.000 bps (= 1/3 × 15); no change →
+  0; a long/short book held 20 days with zero turnover → 3.968 bps borrow
+  (= 50 × 20/252).
+* **Alpha/beta regression:** recovered beta 0.64 for a true 0.60; a pure 0.7-beta
+  book with zero alpha gave alpha t = −0.36.
+* **Detects a real signal, and costs alone sink random ones:** with scores that
+  genuinely predict returns all seven books were profitable net (+48 to +93 bps per
+  5-day period, t from 9.7 to 15.0); with random scores all seven lost 13–23 bps per
+  period from costs alone.
+* **Factor attribution:** with forward returns made to depend on `mom21` only, `mom21`
+  showed IC +0.340 (t = 37.6), `mom5` +0.157 (correlated with it), `vol21` and
+  `beta` ≈ 0; on the unplanted data all four were within noise.
+* **Ledger:** replaying 170 daily runs online and recomputing offline from the same
+  schedule gave identical results (≤ 7e-8, weight rounding); entries exactly one
+  horizon apart; re-running the same day changes nothing; six load cases (download
+  ok / file not there yet / network failure / corrupt file / no HF / local file) all
+  behave as specified.
+* **Full run** (three universes, 112 cells each) takes about 10 seconds; with the
+  ledger, two consecutive daily runs, then a repeat on identical data, left the
+  ledger unchanged.
+* **Verdict calibration on pure noise** (30 independent datasets, 36-ETF universe):
+  29 "Not supported", 1 "Suggestive", 0 "Supported"; the selected book's holdout net
+  t averaged −0.71 (costs), with 3% ≥ 1.0 and none ≥ 1.65.
+* **Verdict on planted momentum:** a weak but real effect (`mom21` IC +0.022, t = 2.2)
+  was **not** monetizable — gross +8.8 bps, net −0.3 bps per 5-day period — while a
+  stronger one (`mom21` IC +0.057, t = 5.8) was **Supported**: top-5, 5 days, net
+  +19.7 bps (t = 1.91, alpha t = 1.84, beta +0.12), 100% of cells net-positive. The
+  gap between those two is the point: a statistically significant IC of ~0.02 does not
+  survive 15 bps round trip. (The thresholds are specific to the simulated ~1% daily
+  volatility, 36 names and these costs — not a universal rule.)
 
-**Limits to keep in mind:**
+## Limits to keep in mind
 
-* Rank-ordered eigenvalue tracking blurs mode identity at avoided crossings
-  (when λ2 and λ3 swap, "the 2nd mode" is a different eigenvector before and
-  after) — the very eigenvalue-repulsion phenomenon being studied, not a bug,
-  but it means the k-th eigenvalue's flow is not always one persistent mode.
-  Only the market mode's loading change is tracked mode-by-mode (absolute
-  loadings, sign-safe).
-* N and the window are small relative to RMT's asymptotics (q = N/W is
-  0.17–0.7), so daily level-spacing statistics are noisy; with W=63 some
-  spacing triggers produce no onsets at all (shown as n/a).
-* FI_COMMODITIES has only 7 ETFs, so the spacing statistics are skipped and
-  "top 3" is 43% of the universe — the same structural limit seen on the
-  sibling engines.
-* The correlation spectrum is a statistic of the same returns being ranked;
-  anything it adds has to beat price features and static exposure on the
-  holdout, which is exactly what the three-level comparison is for.
+* The study design post-dates the observation that motivated it (see the ledger).
+* Long-only "active vs equal-weight" books are tradable only as a relative
+  position (own the top N instead of the whole universe, or hedge the universe);
+  the hedge's own cost is not modeled.
+* FI_COMMODITIES has 7 ETFs: "top 3" is 43% of the universe and a quintile is a
+  single name, so its books are blunt by construction.
+* 112 cells per universe and three universes: the verdict rests on the single
+  selected holdout, but the heatmaps and the "best holdout cells" line are
+  best-of-N views and will look good by chance.
+* The score is refit with a trailing window and uses only data available at each
+  rebalance (the fit at row *i* uses rows ≤ *i − horizon*, whose forward returns
+  have fully realized), so there is no look-ahead — but survivorship in the ETF list
+  itself is not corrected.
 
-Nothing here says it works on real markets. The first real run is the actual
-test; read the holdout numbers and both baseline comparisons before the picks.
-Realistic rank-IC for a daily cross-sectional signal is small (0.01–0.05), and
-with 72 configurations per universe a single strong-looking cell is expected
-by chance. This is not financial advice.
+Nothing here says the baseline is monetizable on real markets. Run it, read the
+verdict and the robustness tables together, and treat the forward ledger as the
+real test. This is not financial advice.
 
 ## Repo structure
 
 ```
-config.py          universes, asset-class tags, spectral/flow parameters, grid,
-                   LEAD_PARAMS and LEAD_TRIGGERS
+config.py          universes, asset-class tags, features/horizons/windows, the seven
+                   books, costs, verdict thresholds, pre-registered ledger set
 data_manager.py     master parquet from HF (same as sibling repos)
-spectral_model.py   rolling correlation matrices, batched eigendecomposition,
-                   structure statistics, flow features, class-neutral
-                   standardization, O(1) window ridge fits, three-model walk-
-                   forward, permutation lead diagnostic
-trainer.py          per-universe orchestration, selection/holdout, live picks, JSON
-push_results.py     HfApi.upload_file to the results dataset
+book_model.py       price features, ridge scores, class-neutral standardization, the
+                   seven book builders, turnover/borrow costing, alpha/beta
+                   regression, factor attribution
+ledger.py           forward ledger: append (once per holding period), score matured
+                   entries, summarize, safe load
+trainer.py          grid, selection on the first 70%, holdout verdict, robustness
+                   tables, live books, ledger update, JSON + ledger upload
+push_results.py     HfApi.upload_file (results JSON and ledger together)
 us_calendar.py       trading-day helpers
-streamlit_app.py     Tab 1 live picks, spectrum today vs lookback, structure
-                   state, ETF exposure map; Tab 2 backtest grid, curves,
-                   eigenvalue paths, transition lead tests with p-values
+streamlit_app.py     Verdict / Robustness & Backtest / Forward Record tabs
 .github/workflows/daily_run.yml   weekday cron after the US close
 ```
 
@@ -179,11 +171,11 @@ streamlit_app.py     Tab 1 live picks, spectrum today vs lookback, structure
 
 ```bash
 pip install -r requirements.txt
-python trainer.py                 # writes spectral_results_YYYY-MM-DD.json, pushes to HF
+python trainer.py          # writes book_results_YYYY-MM-DD.json and forward_ledger.json, pushes both to HF
 streamlit run streamlit_app.py
 ```
 
-Set `HF_TOKEN`; create the dataset repo `P2SAMAPA/p2-etf-spectral-flow-results`
-or change `config.RESULTS_REPO`. To stop the live configuration re-selecting
-daily, set `config.PINNED_CONFIG = {"corr_window": 126, "horizon": 5,
-"window": 756, "neutralize": True}`.
+Set `HF_TOKEN`; create the dataset repo `P2SAMAPA/p2-etf-baseline-book-results`
+or change `config.RESULTS_REPO`. For the ledger to persist between scheduled runs
+the workflow must have `HF_TOKEN` set — without it each run starts a fresh local
+ledger.

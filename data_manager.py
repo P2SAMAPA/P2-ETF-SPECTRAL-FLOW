@@ -14,9 +14,8 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# Macro columns are not used by this engine (the spectrum is built purely
-# from the ETF return correlation structure). Loaded anyway, best-effort, in
-# case a future diagnostic wants VIX for context.
+# Macro columns are not used by this study (price features only). Loaded
+# anyway, best-effort, in case a future diagnostic wants VIX for context.
 MACRO_COLS_CORE = ["VIX", "T10Y2Y", "DXY"]
 MACRO_COLS_EXTENDED = ["IG_SPREAD", "HY_SPREAD"]
 

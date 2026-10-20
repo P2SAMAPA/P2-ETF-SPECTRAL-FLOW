@@ -1,12 +1,21 @@
 """
-config.py  —  Configuration for P2 SPECTRAL-FLOW
+config.py  —  Configuration for P2 BASELINE-BOOK
+
+A monetization study, not a new signal. Across the last several engines the
+only ranking information that held up on real data sat in the plain price
+baseline (momentum, volatility, beta): rank-IC around 0.03-0.05 — yet the
+concentrated "top 3 vs the universe" product lost money after costs every
+time. This repo asks the narrower question: can THAT baseline be turned into
+a book that makes money after costs, and if so, which kind of book, and is it
+alpha or just market exposure?
 """
 
 import os
 
 HF_TOKEN = os.environ.get("HF_TOKEN")
 DATA_REPO = "P2SAMAPA/fi-etf-macro-signal-master-data"
-RESULTS_REPO = "P2SAMAPA/p2-etf-spectral-flow-results"
+RESULTS_REPO = "P2SAMAPA/p2-etf-baseline-book-results"
+LEDGER_FILE = "forward_ledger.json"
 
 UNIVERSES = {
     "FI_COMMODITIES": ["TLT", "VCIT", "LQD", "HYG", "VNQ", "GLD", "SLV"],
@@ -14,11 +23,8 @@ UNIVERSES = {
     "COMBINED": ["TLT", "VCIT", "LQD", "HYG", "VNQ", "GLD", "SLV", "SPY", "QQQ", "XLK", "XLF", "XLE", "XLV", "XLI", "VUG", "VTV", "SPYG", "QUAL", "IWR", "VO", "VB", "VIG", "VEA", "VGT", "VDE", "XLC", "IBB", "XLY", "XLP", "XLU", "GDX", "XME", "IWF", "XSD", "SOXX", "SMH", "URA", "XBI", "IWM", "IWD", "IWO", "XLB", "XLRE"]
 }
 
-TOP_N = 3
-
-# Hand-labeled, static asset-class tags — used only by the asset-class-
-# neutral ranking mode (see NEUTRALIZE_OPTIONS) and the dashboard coloring;
-# just what each ETF IS, not a model input in the non-neutral mode.
+# Hand-labeled, static asset-class tags: used to build class-neutral books and
+# for dashboard coloring. Not a model input.
 ASSET_CLASS_MAP = {
     "TLT": "Fixed Income", "VCIT": "Fixed Income", "LQD": "Fixed Income", "HYG": "Fixed Income",
     "VNQ": "Real Estate", "XLRE": "Real Estate",
@@ -33,126 +39,82 @@ ASSET_CLASS_MAP = {
     "XSD": "Equity-Sector", "SOXX": "Equity-Sector", "SMH": "Equity-Sector", "XBI": "Equity-Sector",
     "XLB": "Equity-Sector", "VUG": "Equity-Sector", "VTV": "Equity-Sector",
 }
-
-# Classes with fewer members than this are NOT de-meaned within themselves in
-# class-neutral mode (a singleton class de-meaned within itself becomes
-# exactly zero on every day and then fills a top-3 slot as a meaningless 0.0%
-# "pick" — seen on the sibling graphon engine's FI_COMMODITIES output, where
-# VNQ is the only real-estate ETF). Their members are de-meaned against the
-# universe-wide mean instead.
+# Classes smaller than this are de-meaned / ranked against the universe-wide
+# pool rather than against themselves (a singleton class de-meaned against
+# itself is a constant zero). Carried over from the spectral-flow engine.
 MIN_CLASS_SIZE = 3
 
 # ---------------------------------------------------------------------------
-# Spectral dynamics.
-#
-# Each day t, take the trailing CORR_WINDOW days of returns, form the
-# correlation matrix C(t) (N x N), and eigendecompose it:
-#     lambda_1(t) >= ... >= lambda_N(t),   eigenvectors u_k(t)
-# (the eigenvalues of a correlation matrix sum to N). The engine models how
-# the SPECTRUM MOVES — d(lambda_k)/dt over FLOW_LOOKBACK days — not returns:
-#   * market-mode flow : relative change in lambda_1 (correlation building /
-#                        dissolving across the whole universe)
-#   * rotation flow    : relative change in the mean of lambda_2..lambda_K
-#   * bulk flow        : relative change in lambda_{K+1}, the top edge of
-#                        the remaining "bulk"
-# and four market-level STRUCTURE statistics (diagnostics, tested against
-# large aggregate moves — see LEAD_PARAMS):
-#   * absorption ratio (Kritzman, Li, Page & Rigobon 2011, "Principal
-#     Components as a Measure of Systemic Risk"): share of total variance in
-#     the top ~N/5 eigenvalues
-#   * relative spectral gap (lambda_1 - lambda_2) / lambda_1  ("gap collapse")
-#   * bulk edge lambda_{K+1}                                  ("bulk expansion")
-#   * mean consecutive-level-spacing ratio <r> (Oganesyan & Huse 2007; Atas
-#     et al. 2013): ~0.53 for GOE-like level REPULSION, ~0.39 for Poisson-like
-#     CONDENSATION/clustering; needs enough bulk eigenvalues, so only
-#     computed when N >= MIN_N_SPACING.
-#
-# A market-level scalar (the same for every ETF on a given day) cannot rank
-# ETFs by itself — cross-sectional z-scoring removes it. So the dynamics
-# enter the ranking model only as INTERACTIONS with each ETF's own exposure
-# to the moving mode (its squared eigenvector loading): "this mode is
-# strengthening, and this ETF loads heavily on it." See spectral_model.py.
+# The score: a ridge regression of the cross-sectionally standardized forward
+# H-day return on FOUR price features only (no spectral, graphon, hyperbolic
+# or any other engine's features), refit at each rebalance on the trailing
+# WINDOW days:  mom5, mom21, vol21, beta (rolling beta to the equal-weight
+# universe return).
 # ---------------------------------------------------------------------------
-CORR_WINDOWS = [63, 126, 252]
-FLOW_LOOKBACK = 10
-TOP_MODES = 3
-TS_Z_WINDOW = 252          # trailing window for time-series z-scoring of market-level flow scalars
-TS_Z_MIN = 63
-MIN_N_SPACING = 20
-
-# Grid axis: de-mean features AND the forward-return target (and score the
-# IC/spread against the de-meaned returns, not raw ones) within each asset
-# class. Carried over from the sibling graphon engine, where neutralizing
-# erased a COMBINED-universe "High" result that turned out to be a
-# commodity-momentum call — and where scoring neutral rankings against RAW
-# returns was found (by simulation) to understate within-class skill by up to
-# ~half; that evaluation flaw is fixed here from the start. Spectral
-# exposures are especially exposed to this confound, since the top
-# eigenvectors ARE largely asset-class modes.
-NEUTRALIZE_OPTIONS = [False, True]
-
-# ---------------------------------------------------------------------------
-# Prediction: pooled ridge regression of the cross-sectionally standardized
-# forward H-day return on standardized features, refit at each evaluation
-# date on the trailing WINDOW days. THREE nested models share the machinery:
-#   price-only : mom5, mom21, vol21, beta
-#   baseline   : price-only + STATIC spectral exposure (squared loadings on
-#                the market mode and rotation modes) — i.e. ordinary
-#                PCA/RMT-style structure with no dynamics
-#   spectral   : baseline + the DYNAMICS (loading changes, and exposure x
-#                eigenvalue-flow interactions)
-# The gate and confidence compare `spectral` against `baseline`, so the
-# dynamics must beat static spectral structure to earn credit; the
-# price-only comparison is reported for context only.
-# ---------------------------------------------------------------------------
-HORIZONS = [1, 5, 20]
-WINDOWS = [252, 504, 756, 1008]
+BETA_WINDOW = 126
+HORIZONS = [1, 5, 10, 20]
+WINDOWS = [504, 1008]
 RIDGE_LAMBDA = 0.01
 MIN_TRAIN_DAYS = 60
+# Whether the score model is fit on class-neutral features/target (True) or
+# plain cross-sectional ones (False). Both are run.
+MODEL_NEUTRAL_OPTIONS = [False, True]
+
+# ---------------------------------------------------------------------------
+# The books built from the SAME score. Long-only books are measured ACTIVE vs
+# the equal-weight universe (i.e. "own the top N instead of owning
+# everything"); long/short books are dollar-neutral. The *_cn books rank
+# WITHIN each asset class and are class-neutral by construction (each class's
+# longs and shorts offset), so their raw P&L is a tradable class-neutral
+# P&L — not a metric scored against adjusted returns.
+# ---------------------------------------------------------------------------
+CONSTRUCTIONS = ["top3_ew", "top5_ew", "topq_ew", "ls_quintile", "rank_ls", "ls_quintile_cn", "rank_ls_cn"]
+LONG_ONLY = {"top3_ew", "top5_ew", "topq_ew"}
+CONSTRUCTION_LABELS = {
+    "top3_ew": "Top 3, equal weight (long-only vs universe)",
+    "top5_ew": "Top 5, equal weight (long-only vs universe)",
+    "topq_ew": "Top quintile, equal weight (long-only vs universe)",
+    "ls_quintile": "Long top quintile / short bottom quintile",
+    "rank_ls": "Rank-weighted long/short",
+    "ls_quintile_cn": "Quintile long/short within asset class",
+    "rank_ls_cn": "Rank-weighted long/short within asset class",
+}
+QUANTILE = 0.20
+
+# Costs. TRADING_COST_BPS is a ROUND-TRIP cost per unit of notional replaced
+# (the convention of every sibling engine), i.e. TRADING_COST_BPS/2 per unit
+# of traded notional on each side; a book's per-period cost is
+# sum|w_t - w_{t-1}| * TRADING_COST_BPS/2. Long/short books also pay a
+# short-borrow/financing charge on short notional (an ASSUMPTION — liquid
+# index ETFs are cheap to short, thematic ones are not).
+TRADING_COST_BPS = 15
+SHORT_BORROW_BPS_ANNUAL = 50
 
 SELECTION_FRACTION = 0.70
 MIN_HOLDOUT_PERIODS = 30
-TRADING_COST_BPS = 15
-IC_T_HIGH = 1.65
-
-# Selection eligibility requires an absolute AND relative selection-segment
-# period-count floor, and confidence is capped at Low whenever the selection
-# gate didn't pass — both carried over from the sibling engines after
-# real-data runs there showed what goes wrong without them.
 MIN_SELECTION_N = 50
 MIN_SELECTION_N_FRACTION = 0.15
 
-# Optional: pin the live configuration, e.g.
-# {"corr_window": 126, "horizon": 5, "window": 756, "neutralize": True}
-PINNED_CONFIG = None
+# Verdict on the SELECTED book's holdout (chosen on the selection segment
+# only, so the holdout is a single honest test):
+#   Supported     : gate passed, n >= MIN_HOLDOUT_PERIODS, net mean > 0,
+#                   net t >= SUPPORTED_T AND market-adjusted alpha t >= SUPPORTED_T
+#   Suggestive    : gate passed, net mean > 0, net t >= SUGGESTIVE_T, alpha t > 0
+#   Not supported : anything else
+SUPPORTED_T = 1.65
+SUGGESTIVE_T = 1.0
 
-# Structure-transition lead diagnostics: does a move in a market-level
-# spectral statistic tend to sit before a large aggregate (equal-weight
-# universe) move? Each statistic is converted to a trigger the same way
-# (Kritzman et al.'s absorption-ratio "shift"): z = (mean of the last
-# SHORT_AVG days - mean of the last LONG_AVG days) / std over LONG_AVG days;
-# an onset is the CROSSING of +/- Z_THRESHOLD in the stated direction.
-# Triggers, windows and thresholds are fixed here in advance, not tuned.
-# NOTE: several triggers x several windows x several universes are tested, so
-# a few "significant" p-values are expected by chance alone — the dashboard
-# states the count.
-LEAD_PARAMS = {
-    "short_avg": 15,
-    "long_avg": 252,
-    "z_threshold": 1.5,
-    "event_window": 10,
-    "event_vol_k": 2.0,
-    "dedup_days": 21,
-    "lead_window": 20,
-    "n_shifts": 300,
-}
-LEAD_TRIGGERS = {
-    # name: (statistic, direction of crossing that counts as an onset)
-    "absorption_up": ("absorption_ratio", "up"),
-    "gap_collapse": ("rel_gap", "down"),
-    "bulk_expansion": ("bulk_edge", "up"),
-    "condensation": ("spacing_ratio", "down"),
-    "repulsion": ("spacing_ratio", "up"),
+# Forward ledger: a PRE-REGISTERED set of books recorded every run with no
+# selection and no later change, scored only after their holding period has
+# elapsed. This is the only evidence here that is out-of-sample with respect
+# to the analyst's own choices (everything in the backtest grid was designed
+# after earlier engines already showed the baseline looking good on these
+# same dates).
+LEDGER_BOOKS = {
+    "constructions": ["top3_ew", "top5_ew", "ls_quintile", "rank_ls", "rank_ls_cn"],
+    "horizons": [5, 20],
+    "window": 756,
+    "model_neutral": False,
 }
 
-SERIES_STEP = 3
+SERIES_STEP = 1

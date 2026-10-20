@@ -1,31 +1,24 @@
 """
-trainer.py  —  P2 SPECTRAL-FLOW trainer
+trainer.py  —  P2 BASELINE-BOOK
 
-Tracks the eigenvalue spectrum of each universe's rolling correlation matrix
-and asks two separate questions:
+A monetization study. For each universe it asks whether the plain price
+baseline (mom5, mom21, vol21, beta -> ridge score) can be turned into a book
+that makes money AFTER costs, and which kind of book:
 
-  1. RANKING. Does where the spectrum is MOVING (market-mode, rotation-mode
-     and bulk flow, interacted with each ETF's own eigenvector exposure,
-     plus loading changes) help rank ETFs by forward return relative to the
-     universe, over and above (a) price features and (b) STATIC spectral
-     exposure — i.e. ordinary PCA/RMT-style structure with no dynamics?
-  2. TRANSITIONS. Do market-level structure statistics — absorption-ratio
-     shift, spectral gap collapse, bulk expansion, level condensation, level
-     repulsion — tend to sit before a large aggregate move, against a
-     circular-shift permutation chance level with a p-value?
-
-Design choices, each carried over from a sibling engine for a stated reason:
-  * Cross-sectional standardization; non-overlapping test points one horizon
-    apart; Sharpe annualized by sqrt(252/horizon); cost on the fraction of
-    top-N replaced.
-  * Baseline ablation — here a THREE-level one (price-only / + static spectral
-    exposure / + dynamics), with the gate and confidence comparing against the
-    static-exposure baseline so only the dynamics increment earns credit.
-  * Selection/holdout split; absolute AND relative selection-period floors;
-    confidence capped at Low whenever the selection gate did not pass.
-  * Asset-class-neutral mode as a grid axis, with IC/spread SCORED against
-    class-neutral returns in that mode (scoring against raw returns understates
-    within-class skill) and small classes handled so no ticker is zeroed out.
+  * a grid of 112 cells per universe: 2 score models (plain / class-neutral
+    fit) x 2 training windows x 4 horizons x 7 book constructions
+  * the book is CHOSEN on the first 70% of the non-overlapping periods only,
+    then judged once on the untouched last 30% — so the holdout is a single
+    honest test, not a best-of-112
+  * the verdict requires both a positive net t-statistic and a positive
+    MARKET-ADJUSTED alpha t-statistic: a long/short book that is quietly long
+    high-beta names earns money in a rising market with no ranking skill
+  * grid-wide robustness is reported next to the pick (share of cells that make
+    money, by construction and horizon), plus each raw feature's own IC so the
+    blended score can be traced to momentum, a volatility tilt, or a beta tilt
+  * a pre-registered set of books is appended to a forward ledger every run and
+    scored only after its holding period elapses — the one piece of evidence
+    that is out-of-sample with respect to how this study was designed
 """
 
 import os
@@ -41,7 +34,8 @@ import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
-import spectral_model as sm
+import book_model as bm
+import ledger as lg
 from data_manager import load_master_data, validate_data
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
@@ -63,118 +57,78 @@ def _clean(d: Dict) -> Dict:
             for k, v in d.items()}
 
 
-def confidence_label(hold: Dict, gate_passed: bool = True) -> str:
+def select_cell(grid: List[Dict]):
     """
-    Graded on the HOLDOUT of the selected configuration and capped at Low
-    whenever the selection gate did not pass. The comparison is against the
-    STATIC-spectral-exposure baseline, so only the dynamics increment counts.
-      High   : holdout rank-IC t >= IC_T_HIGH, net top-N spread > 0, and the
-               spectral model beats the baseline on both IC and net spread.
-      Medium : IC > 0, net spread > 0, and beats the baseline on both.
-      Low    : anything else, fewer than MIN_HOLDOUT_PERIODS periods, or gate failed.
+    SELECTION segment only. Eligible: net mean > 0 and net t > 0 there, with the
+    selection-period count clearing both the absolute (MIN_SELECTION_N) and
+    relative (MIN_SELECTION_N_FRACTION of the pool's largest) floors — so a
+    thin-sample long-horizon cell cannot win on variance. Among eligible, the
+    highest selection net t. If nothing is eligible, fall back to the best
+    size-filtered cell and report gate_passed=False.
     """
-    if not gate_passed:
-        return "Low"
-    if hold.get("n", 0) < config.MIN_HOLDOUT_PERIODS:
-        return "Low"
-    beats = hold["d_ic_mean"] > 0 and hold["d_spread_mean"] > 0
-    if hold["ic_t"] >= config.IC_T_HIGH and hold["net_spread_mean"] > 0 and beats:
-        return "High"
-    if hold["ic_mean"] > 0 and hold["net_spread_mean"] > 0 and beats:
-        return "Medium"
-    return "Low"
-
-
-def select_config(grid: List[Dict], corr_window: Optional[int] = None):
-    """
-    SELECTION segment only: eligible if rank-IC and net top-N spread are both
-    positive there AND the selection-period count clears both the absolute
-    (MIN_SELECTION_N) and relative (MIN_SELECTION_N_FRACTION of the pool's
-    largest) floors; among eligible, rank-sum of the two t-stats. If none are
-    eligible, fall back to the size-filtered pool with gate_passed=False.
-    """
-    pool = [g for g in grid if (corr_window is None or g["corr_window"] == corr_window)
-            and g["selection"].get("n", 0) >= config.MIN_SELECTION_N]
+    pool = [g for g in grid if g["selection"].get("n", 0) >= config.MIN_SELECTION_N]
     if not pool:
         return None, False
     max_n = max(g["selection"]["n"] for g in pool)
     pool = [g for g in pool if g["selection"]["n"] >= config.MIN_SELECTION_N_FRACTION * max_n]
     if not pool:
         return None, False
-    elig = [g for g in pool if g["selection"]["ic_mean"] > 0 and g["selection"]["net_spread_mean"] > 0]
+    elig = [g for g in pool if g["selection"]["net_mean"] > 0 and g["selection"]["net_t"] > 0]
     gate = bool(elig)
     cand = elig if gate else pool
-    ic_order = {id(g): r for r, g in enumerate(sorted(cand, key=lambda g: g["selection"]["ic_t"]))}
-    sp_order = {id(g): r for r, g in enumerate(sorted(cand, key=lambda g: g["selection"]["net_spread_t"]))}
-    best = max(cand, key=lambda g: (ic_order[id(g)] + sp_order[id(g)], g["selection"]["ic_t"]))
-    return best, gate
+    return max(cand, key=lambda g: (g["selection"]["net_t"], g["selection"]["n"])), gate
 
 
-def make_picks(scores: np.ndarray, tickers: List[str], dispersion: float, horizon: int,
-               confidence: str, top_n: int) -> List[Dict]:
-    order = np.argsort(-scores)[:top_n]
-    return [{"ticker": tickers[j], "expected_return": round(float(scores[j] * dispersion * 100), 3),
-             "score_z": round(float(scores[j]), 4), "horizon_days": int(horizon), "confidence": confidence}
-            for j in order]
+def verdict_for(hold: Dict, gate_passed: bool) -> str:
+    """
+    Supported     : gate passed, enough holdout periods, net mean > 0, net t and
+                    market-adjusted alpha t both >= SUPPORTED_T
+    Suggestive    : gate passed, net mean > 0, net t >= SUGGESTIVE_T, alpha t > 0
+    Not supported : anything else
+    """
+    if not gate_passed or hold.get("n", 0) < config.MIN_HOLDOUT_PERIODS:
+        return "Not supported"
+    nm, nt, at = hold["net_mean"], hold["net_t"], hold.get("alpha_t")
+    if at is None:
+        return "Not supported"
+    if nm > 0 and nt >= config.SUPPORTED_T and at >= config.SUPPORTED_T:
+        return "Supported"
+    if nm > 0 and nt >= config.SUGGESTIVE_T and at > 0:
+        return "Suggestive"
+    return "Not supported"
 
 
-def pattern_diagnostics(spec: Dict, tickers: List[str], dates: List[str], agg_returns: np.ndarray,
-                        agg_vol21: np.ndarray) -> Dict:
-    """Spectrum snapshot/series, structure state today, ETF exposures, and the transition lead tests."""
-    n, T = spec["lam"].shape
-    last = n - 1
-    st, fl, ex, lam = spec["struct"], spec["flow"], spec["expo"], spec["lam"]
-    lp = config.LEAD_PARAMS
+def robustness_table(grid: List[Dict]) -> Dict:
+    """Holdout results aggregated over models and windows, by construction and horizon."""
     out = {}
-
-    L = config.FLOW_LOOKBACK
-    if np.isfinite(lam[last]).all():
-        out["spectrum_today"] = [round(float(v), 4) for v in lam[last]]
-        if last - L >= 0 and np.isfinite(lam[last - L]).all():
-            out["spectrum_lag"] = [round(float(v), 4) for v in lam[last - L]]
-        out["flow_lookback"] = L
-        out["top_modes"] = spec["K"]
-        out["flow_today"] = {k: _f(fl[k][last]) for k in ["z_mkt", "z_rot", "z_bulk"]}
-
-        e_std = sm.standardize(ex["e_mkt"][last:last + 1], None)[0]
-        snap = []
-        for j in range(T):
-            snap.append({"ticker": tickers[j], "e_mkt": _f(ex["e_mkt"][last, j]), "e_rot": _f(ex["e_rot"][last, j]),
-                         "e_idio": _f(ex["e_idio"][last, j]), "mkt_load_chg": _f(ex["mkt_load_chg"][last, j]),
-                         "idio_chg": _f(ex["idio_chg"][last, j]),
-                         "mkt_flow": _f(e_std[j] * (fl["z_mkt"][last] if np.isfinite(fl["z_mkt"][last]) else np.nan)),
-                         "asset_class": config.ASSET_CLASS_MAP.get(tickers[j])})
-        out["snapshot"] = snap
-
-    idx = np.arange(0, n, config.SERIES_STEP)
-    idx = idx[np.isfinite(lam[idx, 0])]
-    out["series"] = {
-        "dates": [dates[i] for i in idx],
-        "lam1": [_f(lam[i, 0]) for i in idx], "lam2": [_f(lam[i, 1]) for i in idx], "lam3": [_f(lam[i, 2]) for i in idx],
-        "bulk_edge": [_f(st["bulk_edge"][i]) for i in idx],
-        "absorption_ratio": [_f(st["absorption_ratio"][i]) for i in idx],
-        "rel_gap": [_f(st["rel_gap"][i]) for i in idx],
-        "spacing_ratio": [_f(st["spacing_ratio"][i]) for i in idx],
-    }
-
-    z_by_stat, state, leads = {}, {}, {}
-    for stat in ["absorption_ratio", "rel_gap", "bulk_edge", "spacing_ratio"]:
-        series = st[stat]
-        if not np.isfinite(series).any():
-            continue
-        z = sm.shift_trigger_z(series, lp["short_avg"], lp["long_avg"])
-        z_by_stat[stat] = z
-        state[stat] = {"value": _f(series[last]), "shift_z": _f(z[last])}
-    out["structure_state"] = state
-
-    for seed, (name, (stat, direction)) in enumerate(config.LEAD_TRIGGERS.items()):
-        if stat not in z_by_stat:
-            continue
-        leads[name] = sm.lead_diagnostic(z_by_stat[stat], direction, agg_returns, agg_vol21, lp, seed=seed)
-        leads[name]["statistic"] = stat
-        leads[name]["direction"] = direction
-    out["leads"] = leads
+    for cons in config.CONSTRUCTIONS:
+        out[cons] = {}
+        for h in config.HORIZONS:
+            cells = [g for g in grid if g["construction"] == cons and g["horizon"] == h
+                     and g["holdout"].get("n", 0) >= 20]
+            if not cells:
+                continue
+            nm = np.array([g["holdout"]["net_mean"] for g in cells])
+            out[cons][str(h)] = {
+                "n_cells": len(cells), "mean_net_bps": float(nm.mean() * 1e4),
+                "mean_gross_bps": float(np.mean([g["holdout"]["gross_mean"] for g in cells]) * 1e4),
+                "share_positive": float((nm > 0).mean()),
+                "mean_net_t": float(np.mean([g["holdout"]["net_t"] for g in cells])),
+                "mean_alpha_t": float(np.mean([g["holdout"]["alpha_t"] for g in cells if g["holdout"].get("alpha_t") is not None])),
+                "mean_beta": float(np.mean([g["holdout"]["beta"] for g in cells if g["holdout"].get("beta") is not None])),
+                "mean_turnover": float(np.mean([g["holdout"]["turnover_mean"] for g in cells])),
+            }
     return out
+
+
+def book_list(weights: np.ndarray, scores: Optional[np.ndarray], tickers: List[str]) -> List[Dict]:
+    rows = []
+    for j, t in enumerate(tickers):
+        if weights[j] != 0:
+            rows.append({"ticker": t, "weight": round(float(weights[j]), 5),
+                         "score": round(float(scores[j]), 4) if scores is not None else None,
+                         "asset_class": config.ASSET_CLASS_MAP.get(t)})
+    return sorted(rows, key=lambda r: -r["weight"])
 
 
 def analyze_universe(name: str, tickers: List[str], prices_df: pd.DataFrame) -> Optional[Dict]:
@@ -191,106 +145,98 @@ def analyze_universe(name: str, tickers: List[str], prices_df: pd.DataFrame) -> 
     returns = np.diff(np.log(values), axis=0)
     dates = [d.strftime("%Y-%m-%d") for d in px_df.index[1:]]
     n = len(dates)
+    gids = bm.group_ids_from_map(available, config.ASSET_CLASS_MAP, config.MIN_CLASS_SIZE)
+    F_raw = bm.build_price_features(returns, config.BETA_WINDOW)
+    fwd_by_h = {h: bm.compute_forward_returns(returns, h) for h in config.HORIZONS}
 
-    cfg = dict(ridge_lambda=config.RIDGE_LAMBDA, min_train_days=config.MIN_TRAIN_DAYS, cost_bps=config.TRADING_COST_BPS)
-    gids = sm.group_ids_from_map(available, config.ASSET_CLASS_MAP, config.MIN_CLASS_SIZE)
-    fwd_by_h = {h: sm.compute_forward_returns(returns, h) for h in config.HORIZONS}
-    yz, fwd_eval = {}, {}
-    for h in config.HORIZONS:
-        for neut in config.NEUTRALIZE_OPTIONS:
-            yz[(h, neut)] = sm.standardize(fwd_by_h[h], gids if neut else None)
-            fwd_eval[(h, neut)] = sm.demean_by_group(fwd_by_h[h], gids) if neut else fwd_by_h[h]
-
-    agg_returns = np.nanmean(returns, axis=1)
-    s1 = sm.trailing_sum(agg_returns.reshape(-1, 1), 21)[:, 0]
-    s2 = sm.trailing_sum((agg_returns ** 2).reshape(-1, 1), 21)[:, 0]
-    agg_vol21 = np.sqrt(np.maximum((s2 - s1 ** 2 / 21) / 20, 1e-10))
-
-    grid, wf_store, live_ctx, patterns = [], {}, {}, {}
-    for cw in config.CORR_WINDOWS:
-        logger.info(f"  [{name}] corr_window={cw}: eigendecomposing rolling correlation matrices...")
-        spec = sm.build_spectrum(returns, cw, config.TOP_MODES, config.FLOW_LOOKBACK, config.TS_Z_WINDOW,
-                                 config.TS_Z_MIN, config.MIN_N_SPACING)
-        patterns[cw] = pattern_diagnostics(spec, available, dates, agg_returns, agg_vol21)
-
-        for neut in config.NEUTRALIZE_OPTIONS:
-            Fz = sm.build_features(returns, spec, cw, gids if neut else None)
-            for h in config.HORIZONS:
-                cp = sm.build_cross_products(Fz, yz[(h, neut)])
-                for window in config.WINDOWS:
-                    wf = sm.walk_forward(Fz, cp, fwd_eval[(h, neut)], h, window, config.TOP_N, cfg)
-                    key = (cw, h, window, neut)
-                    live_ctx[key] = (Fz, cp)
-                    if wf is None:
-                        continue
-                    m = len(wf["rows"])
-                    split = int(m * config.SELECTION_FRACTION)
+    grid, scores_store, ctx = [], {}, {}
+    for mn in config.MODEL_NEUTRAL_OPTIONS:
+        g_arg = gids if mn else None
+        Fz = np.stack([bm.standardize(F_raw[:, :, j], g_arg) for j in range(bm.N_FEAT)], axis=2)
+        for h in config.HORIZONS:
+            cp = bm.build_cross_products(Fz, bm.standardize(fwd_by_h[h], g_arg))
+            ctx[(mn, h)] = (Fz, cp)
+            for window in config.WINDOWS:
+                wf = bm.walk_forward_scores(Fz, cp, fwd_by_h[h], h, window)
+                if wf is None:
+                    continue
+                scores_store[(mn, h, window)] = wf
+                m = len(wf["rows"])
+                split = int(m * config.SELECTION_FRACTION)
+                for cons in config.CONSTRUCTIONS:
+                    ev = bm.evaluate_book(cons, wf["S"], wf["R"], gids, h)
                     grid.append({
-                        "corr_window": cw, "horizon": h, "window": window, "neutralize": neut, "n_periods": m,
-                        "selection": _clean(sm.summarize(wf, 0, split, h)),
-                        "holdout": _clean(sm.summarize(wf, split, m, h)),
-                        "full": _clean(sm.summarize(wf, 0, m, h)),
+                        "model_neutral": mn, "window": window, "horizon": h, "construction": cons, "n_periods": m,
+                        "selection": _clean(bm.summarize(ev, 0, split, h)),
+                        "holdout": _clean(bm.summarize(ev, split, m, h)),
+                        "full": _clean(bm.summarize(ev, 0, m, h)),
                     })
-                    wf_store[key] = (wf, split)
-        logger.info(f"  [{name}] corr_window={cw}: done ({len([g for g in grid if g['corr_window'] == cw])} configs)")
-
+        logger.info(f"  [{name}] score model {'class-neutral' if mn else 'plain'}: {len(grid)} cells so far")
     if not grid:
         return None
 
-    def live_for(g):
-        Fz, cp = live_ctx[(g["corr_window"], g["horizon"], g["window"], g["neutralize"])]
-        return sm.live_scores(Fz, cp, fwd_by_h[g["horizon"]], g["horizon"], g["window"], cfg)
-
-    selected, gate = select_config(grid)
-    pinned = False
-    pin = config.PINNED_CONFIG
-    if pin:
-        match = [g for g in grid if g["corr_window"] == pin["corr_window"] and g["horizon"] == pin["horizon"]
-                and g["window"] == pin["window"] and g["neutralize"] == pin.get("neutralize", False)]
-        if match:
-            selected, pinned, gate = match[0], True, True
+    selected, gate = select_cell(grid)
     if selected is None:
         return None
+    hold = selected["holdout"]
+    verdict = verdict_for(hold, gate)
 
-    ls = live_for(selected)
-    conf = confidence_label(selected["holdout"], gate)
-    picks = base_picks = []
-    if ls is not None:
-        picks = make_picks(ls["score_m"], available, ls["dispersion"], selected["horizon"], conf, config.TOP_N)
-        base_picks = make_picks(ls["score_b"], available, ls["dispersion"], selected["horizon"], conf, config.TOP_N)
-
-    cw_picks = {}
-    for cw in patterns:
-        g, sgate = select_config(grid, cw)
-        if g is None:
-            continue
-        lst = live_for(g)
-        sconf = confidence_label(g["holdout"], sgate)
-        cw_picks[str(cw)] = {
-            "config": {"corr_window": cw, "horizon": g["horizon"], "window": g["window"], "neutralize": g["neutralize"]},
-            "gate_passed": sgate, "holdout": g["holdout"], "confidence": sconf,
-            "picks": make_picks(lst["score_m"], available, lst["dispersion"], g["horizon"], sconf, config.TOP_N)
-            if lst is not None else [],
-        }
-
-    wf, split = wf_store[(selected["corr_window"], selected["horizon"], selected["window"], selected["neutralize"])]
+    # curves for the selected book
+    mn, h, window, cons = selected["model_neutral"], selected["horizon"], selected["window"], selected["construction"]
+    wf = scores_store[(mn, h, window)]
+    ev = bm.evaluate_book(cons, wf["S"], wf["R"], gids, h)
+    split = int(len(wf["rows"]) * config.SELECTION_FRACTION)
     curves = {"dates": [dates[i] for i in wf["rows"]],
-              "spectral_cum": [round(float(v) * 100, 4) for v in np.cumsum(wf["sn_m"])],
-              "baseline_cum": [round(float(v) * 100, 4) for v in np.cumsum(wf["sn_b"])],
+              "net_cum": [round(float(v) * 100, 4) for v in np.cumsum(ev["net"])],
+              "gross_cum": [round(float(v) * 100, 4) for v in np.cumsum(ev["gross"])],
+              "ew_cum": [round(float(v) * 100, 4) for v in np.cumsum(ev["ew"])],
               "split_index": int(split)}
 
-    top = {"corr_window": selected["corr_window"], "horizon": selected["horizon"], "window": selected["window"],
-           "neutralize": selected["neutralize"], "gate_passed": gate, "pinned": pinned, "confidence": conf,
-           "selection": selected["selection"], "holdout": selected["holdout"], "full": selected["full"],
-           "n_periods": selected["n_periods"]}
-    feature_weights = None
-    if ls is not None:
-        feature_weights = {nm: round(float(w), 5) for nm, w in zip(sm.FEATURE_NAMES, ls["beta_m"])}
+    # today's target book for the selected configuration
+    Fz, cp = ctx[(mn, h)]
+    sc = bm.live_score(Fz, cp, h, window)
+    selected_book = book_list(bm.book_weights(cons, sc, gids), sc, available) if sc is not None else []
 
-    return {"tickers": available, "n_days": n, "last_date": dates[-1], "selected": top, "picks": picks,
-            "baseline_picks": base_picks, "grid": grid, "cw_picks": cw_picks, "curves": curves,
-            "patterns": {str(k): v for k, v in patterns.items()}, "feature_weights": feature_weights,
-            "class_groups": {t: int(g) for t, g in zip(available, gids)}}
+    # pre-registered ledger books (fixed set; never re-selected)
+    lb = config.LEDGER_BOOKS
+    ledger_weights, ledger_books_today = {}, {}
+    for lh in lb["horizons"]:
+        Fz2, cp2 = ctx[(lb["model_neutral"], lh)]
+        sc2 = bm.live_score(Fz2, cp2, lh, lb["window"])
+        if sc2 is None:
+            continue
+        for lc in lb["constructions"]:
+            w = bm.book_weights(lc, sc2, gids)
+            ledger_weights[(lc, lh)] = {available[j]: float(w[j]) for j in range(len(available))}
+            ledger_books_today["%s|h%d" % (lc, lh)] = book_list(w, sc2, available)
+
+    attribution = {str(hh): bm.factor_attribution(F_raw, fwd_by_h[hh], gids, hh, config.SELECTION_FRACTION)
+                   for hh in config.HORIZONS}
+
+    top_hold = sorted([g for g in grid if g["holdout"].get("n", 0) >= config.MIN_HOLDOUT_PERIODS],
+                      key=lambda g: -g["holdout"]["net_t"])[:3]
+    all_hold = [g for g in grid if g["holdout"].get("n", 0) >= 20]
+    summary = {
+        "n_cells": len(grid), "n_cells_holdout": len(all_hold),
+        "share_cells_net_positive": float(np.mean([g["holdout"]["net_mean"] > 0 for g in all_hold])) if all_hold else None,
+        "mean_net_bps": float(np.mean([g["holdout"]["net_mean"] for g in all_hold]) * 1e4) if all_hold else None,
+        "mean_gross_bps": float(np.mean([g["holdout"]["gross_mean"] for g in all_hold]) * 1e4) if all_hold else None,
+        "best_holdout_cells": [{"model_neutral": g["model_neutral"], "window": g["window"], "horizon": g["horizon"],
+                                "construction": g["construction"], "net_t": g["holdout"]["net_t"],
+                                "net_mean": g["holdout"]["net_mean"], "n": g["holdout"]["n"]} for g in top_hold],
+    }
+
+    return {
+        "tickers": available, "n_days": n, "last_date": dates[-1],
+        "selected": {"model_neutral": mn, "window": window, "horizon": h, "construction": cons,
+                     "gate_passed": gate, "verdict": verdict, "n_periods": selected["n_periods"],
+                     "selection": selected["selection"], "holdout": hold, "full": selected["full"]},
+        "selected_book": selected_book, "grid": grid, "curves": curves, "robustness": robustness_table(grid),
+        "summary": summary, "factor_ic": attribution, "ledger_books_today": ledger_books_today,
+        "class_groups": {t: int(g) for t, g in zip(available, gids)},
+        # not serialized into the results JSON; used by run_trainer for the ledger
+        "_ledger_weights": ledger_weights, "_dates": dates, "_returns": returns,
+    }
 
 
 def run_trainer() -> Dict:
@@ -303,48 +249,64 @@ def run_trainer() -> Dict:
         return {}
 
     run_date = datetime.now().strftime("%Y-%m-%d")
+    ledger, ledger_status = lg.load_ledger(config.LEDGER_FILE, config.RESULTS_REPO, config.HF_TOKEN)
+    logger.info(f"Forward ledger: {ledger_status} ({len(ledger['books'])} books)")
+    ledger_writable = ledger_status != "hf_error"
+
     results = {
-        "run_date": run_date, "algorithm": "SPECTRAL-FLOW",
-        "top_picks": {}, "selected": {}, "grid": {}, "cw_picks": {}, "baseline_picks": {}, "curves": {},
-        "patterns": {}, "feature_weights": {}, "universe_meta": {},
-        "settings": {"trading_cost_bps": config.TRADING_COST_BPS, "top_n": config.TOP_N,
-                     "selection_fraction": config.SELECTION_FRACTION, "flow_lookback": config.FLOW_LOOKBACK,
-                     "top_modes": config.TOP_MODES, "lead_params": config.LEAD_PARAMS,
-                     "n_lead_tests": sum(len(p.get("leads", {})) for p in []),
-                     "feature_names": sm.FEATURE_NAMES},
+        "run_date": run_date, "algorithm": "BASELINE-BOOK", "ledger_status": ledger_status,
+        "selected": {}, "grid": {}, "curves": {}, "robustness": {}, "summary": {}, "factor_ic": {},
+        "selected_book": {}, "ledger_books_today": {}, "universe_meta": {},
+        "settings": {"trading_cost_bps": config.TRADING_COST_BPS, "short_borrow_bps_annual": config.SHORT_BORROW_BPS_ANNUAL,
+                     "selection_fraction": config.SELECTION_FRACTION, "constructions": config.CONSTRUCTIONS,
+                     "construction_labels": config.CONSTRUCTION_LABELS, "long_only": sorted(config.LONG_ONLY),
+                     "horizons": config.HORIZONS, "ledger_books": config.LEDGER_BOOKS,
+                     "features": bm.PRICE_FEATURES},
     }
-    n_lead_tests = 0
+
     for name, tickers in config.UNIVERSES.items():
         logger.info(f"\n📊 Analyzing {name}...")
         out = analyze_universe(name, tickers, prices_df)
         if out is None:
             continue
-        for key, dst in [("picks", "top_picks"), ("selected", "selected"), ("grid", "grid"), ("cw_picks", "cw_picks"),
-                         ("baseline_picks", "baseline_picks"), ("curves", "curves"), ("patterns", "patterns"),
-                         ("feature_weights", "feature_weights")]:
-            results[dst][name] = out[key]
+        for key in ["selected", "grid", "curves", "robustness", "summary", "factor_ic", "selected_book",
+                    "ledger_books_today"]:
+            results[key][name] = out[key]
         results["universe_meta"][name] = {"tickers": out["tickers"], "n_days": out["n_days"],
                                           "last_date": out["last_date"], "class_groups": out["class_groups"]}
-        n_lead_tests += sum(len(p.get("leads", {})) for p in out["patterns"].values())
+
+        if ledger_writable:
+            for (lc, lh), wdict in out["_ledger_weights"].items():
+                key = lg.key_for(name, lc, lh)
+                lg.maybe_append(ledger, key, lc, lh, out["_dates"][-1], out["_dates"], wdict, out["tickers"])
+                lg.score_entries(ledger, key, out["_dates"], out["_returns"], out["tickers"])
 
         s = out["selected"]
         h = s["holdout"]
-        logger.info(f"  ✅ Selected: corr_window={s['corr_window']} / {s['horizon']}d / window {s['window']} / "
-                    f"neutralize={s['neutralize']} (selection gate {'passed' if s['gate_passed'] else 'NOT passed'}) | "
-                    f"holdout n={h.get('n')} IC={h.get('ic_mean', 0):+.4f} (t={h.get('ic_t', 0):+.2f}) vs static baseline "
-                    f"IC={h.get('ic_base_mean', 0):+.4f}, price-only IC={h.get('ic_price_mean', 0):+.4f} | net top-"
-                    f"{config.TOP_N} excess {h.get('net_spread_mean', 0) * 1e4:+.1f}bps/period | confidence {s['confidence']}")
-        for p in out["picks"]:
-            logger.info(f"     {p['ticker']}: {p['expected_return']:+.3f}% over {p['horizon_days']}d ({p['confidence']})")
-    results["settings"]["n_lead_tests"] = n_lead_tests
+        logger.info(f"  ✅ Selected: {config.CONSTRUCTION_LABELS[s['construction']]} | {s['horizon']}d | window {s['window']} | "
+                    f"{'class-neutral' if s['model_neutral'] else 'plain'} score (selection gate "
+                    f"{'passed' if s['gate_passed'] else 'NOT passed'})")
+        logger.info(f"     holdout n={h.get('n')} gross {h.get('gross_mean', 0) * 1e4:+.1f} / net {h.get('net_mean', 0) * 1e4:+.1f} "
+                    f"bps/period (t={h.get('net_t', 0):+.2f}), market beta {h.get('beta') or 0:+.2f}, alpha t="
+                    f"{h.get('alpha_t') or 0:+.2f} | verdict: {s['verdict']}")
+        sm_ = out["summary"]
+        logger.info(f"     grid: {sm_['share_cells_net_positive'] * 100:.0f}% of {sm_['n_cells_holdout']} holdout cells net-positive, "
+                    f"mean net {sm_['mean_net_bps']:+.1f} bps")
 
-    output_path = f"spectral_results_{run_date}.json"
+    results["forward_record"] = lg.summarize_ledger(ledger) if ledger_writable else {}
+    output_path = f"book_results_{run_date}.json"
     with open(output_path, "w") as f:
         json.dump(results, f, separators=(",", ":"), default=str)
     logger.info(f"\n💾 Saved: {output_path}")
+
+    files = [output_path]
+    if ledger_writable:
+        files.append(lg.save_ledger(ledger, config.LEDGER_FILE))
+    else:
+        logger.warning("Ledger download failed; NOT saving or uploading a ledger this run so stored history is not overwritten.")
     try:
         from push_results import upload_results
-        upload_results(output_path, hf_token=config.HF_TOKEN)
+        upload_results(files[0], files[1] if len(files) > 1 else None, hf_token=config.HF_TOKEN)
     except Exception as e:
         logger.warning(f"Could not upload results: {e}")
     return results
